@@ -11,6 +11,12 @@ Sheet 1 - Port Inventory:
 Sheet 2 - Cleanup:
   Summary stats (total ports, used, down, % utilization) +
   List of UP ports idle for more than 4 weeks (cols N & O > 4 weeks)
+
+Sheet 3 - MAC Address Compare:
+  One row per MAC: interface | sh mac address-table address <MAC> | MAC | VLAN
+
+Sheet 4 - CDP Neighbors:
+  One row per neighbor: neighbor_name | sh cdp neighbors | include <NAME>
 """
 
 from __future__ import annotations
@@ -303,6 +309,33 @@ def parse_dhcp_snoop(text: str) -> Dict[str, str]:
         out[norm_mac(m.group("mac"))] = "DHCP"
     return out
 
+def parse_cdp_neighbors(text: str) -> List[str]:
+    """
+    Parse 'show cdp neighbors' and return a deduplicated list of neighbor device IDs.
+    Handles both single-line and wrapped two-line CDP neighbor table entries.
+    """
+    neighbors: List[str] = []
+    seen: set = set()
+    for line in text.splitlines():
+        stripped = line.rstrip()
+        if not stripped.strip():
+            continue
+        low = stripped.lower().strip()
+        if low.startswith(("-", "capability", "device", "total")):
+            continue
+        parts = stripped.split()
+        if not parts:
+            continue
+        candidate = parts[0]
+        # Skip if it looks like a local interface
+        if IF_NAME.match(candidate):
+            continue
+        # Must contain at least one letter and not already seen
+        if re.search(r"[A-Za-z]", candidate) and candidate not in seen:
+            neighbors.append(candidate)
+            seen.add(candidate)
+    return neighbors
+
 # -------------------------------- XLSX Styles --------------------------------
 HEADER_FILL  = PatternFill("solid", start_color="1F4E79")
 HEADER_FONT  = Font(bold=True, color="FFFFFF", name="Arial", size=10)
@@ -326,7 +359,7 @@ def style_cell(cell, bold=False, fill=None, font_color="000000", center=False, b
         cell.border = THIN_BORDER
 
 # -------------------------------- Write XLSX --------------------------------
-def write_xlsx(fname: str, rows: List[Dict[str, Any]], switch_name: str):
+def write_xlsx(fname: str, rows: List[Dict[str, Any]], switch_name: str, cdp_neighbors: List[str] = None):
     fields = [
         "switch_name","switch_ip","snmp_location","interface","description","connected","trunk_mode","vlans","voice_vlan",
         "duplex","speed","power_watts","max_sec_devices","last_input","last_output","end_device_mac","end_device_ip","ip_source"
@@ -457,6 +490,74 @@ def write_xlsx(fname: str, rows: List[Dict[str, Any]], switch_name: str):
 
     ws2.freeze_panes = "A6"
 
+    # ── Sheet 3: MAC Address Compare ─────────────────────────────────────────
+    ws3 = wb.create_sheet("MAC Address Compare")
+
+    mac_col_headers = ["Interface", "Verification Command", "MAC Address", "VLAN"]
+    mac_col_widths  = [22, 48, 20, 10]
+    for col_idx, hdr in enumerate(mac_col_headers, start=1):
+        cell = ws3.cell(row=1, column=col_idx, value=hdr)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = CENTER
+        cell.border = THIN_BORDER
+        ws3.column_dimensions[get_column_letter(col_idx)].width = mac_col_widths[col_idx - 1]
+
+    mac_row = 2
+    for r in rows:
+        intf     = r.get("interface", "")
+        vlan     = r.get("vlans", "").split(";")[0].strip()  # use first/access VLAN
+        mac_raw  = r.get("end_device_mac", "")
+        if not mac_raw:
+            continue
+        mac_list = [m.strip() for m in mac_raw.split(";") if m.strip()]
+        for mac in mac_list:
+            cmd = f"sh mac address-table address {mac}"
+            vals = [intf, cmd, mac, vlan]
+            for col_idx, val in enumerate(vals, start=1):
+                cell = ws3.cell(row=mac_row, column=col_idx, value=val)
+                cell.font = Font(name="Arial", size=10)
+                cell.border = THIN_BORDER
+                if col_idx == 2:  # command column — monospace feel
+                    cell.font = Font(name="Courier New", size=10)
+            mac_row += 1
+
+    if mac_row == 2:
+        empty = ws3.cell(row=2, column=1, value="No MAC addresses found in inventory.")
+        empty.font = Font(italic=True, color="595959", name="Arial", size=10)
+        ws3.merge_cells("A2:D2")
+
+    ws3.freeze_panes = "A2"
+
+    # ── Sheet 4: CDP Neighbors ────────────────────────────────────────────────
+    ws4 = wb.create_sheet("CDP Neighbors")
+
+    cdp_col_headers = ["Neighbor Device ID", "Verification Command"]
+    cdp_col_widths  = [40, 55]
+    for col_idx, hdr in enumerate(cdp_col_headers, start=1):
+        cell = ws4.cell(row=1, column=col_idx, value=hdr)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = CENTER
+        cell.border = THIN_BORDER
+        ws4.column_dimensions[get_column_letter(col_idx)].width = cdp_col_widths[col_idx - 1]
+
+    neighbors = cdp_neighbors or []
+    if neighbors:
+        for row_idx, neighbor in enumerate(neighbors, start=2):
+            cmd = f"sh cdp neighbors | include {neighbor}"
+            ws4.cell(row=row_idx, column=1, value=neighbor).border = THIN_BORDER
+            ws4.cell(row=row_idx, column=1).font = Font(name="Arial", size=10)
+            cmd_cell = ws4.cell(row=row_idx, column=2, value=cmd)
+            cmd_cell.font = Font(name="Courier New", size=10)
+            cmd_cell.border = THIN_BORDER
+    else:
+        empty = ws4.cell(row=2, column=1, value="No CDP neighbors found.")
+        empty.font = Font(italic=True, color="595959", name="Arial", size=10)
+        ws4.merge_cells("A2:B2")
+
+    ws4.freeze_panes = "A2"
+
     wb.save(fname)
 
 # -------------------------------- Core builder --------------------------------
@@ -492,6 +593,14 @@ def build_for_switch(sw: Dict[str, Any], cores: List[Dict[str, Any]]) -> List[Di
         macs   = parse_mac_table(mac_tab)
         arpmap = parse_arp(arp_local)
         dstat  = parse_dhcp_snoop(dhcp_snoop)
+
+        # CDP neighbors
+        cdp_neighbors: List[str] = []
+        try:
+            cdp_txt = conn.send_command("show cdp neighbors")
+            cdp_neighbors = parse_cdp_neighbors(cdp_txt)
+        except Exception:
+            pass
 
         core_arp: Dict[str, str] = {}
         for core in cores:
@@ -586,7 +695,7 @@ def build_for_switch(sw: Dict[str, Any], cores: List[Dict[str, Any]]) -> List[Di
         except Exception:
             pass
 
-    return rows
+    return rows, cdp_neighbors
 
 # -------------------------------- Main --------------------------------
 def main():
@@ -624,8 +733,8 @@ def main():
         ts = time.strftime("%Y%m%d-%H%M%S")
         fname = os.path.join(outdir, f"{sw['name']}-{ts}.xlsx")
 
-        rows = build_for_switch(dev, cores)
-        write_xlsx(fname, rows, sw["name"])
+        rows, cdp_neighbors = build_for_switch(dev, cores)
+        write_xlsx(fname, rows, sw["name"], cdp_neighbors)
 
         print(f"Wrote {fname}")
 
